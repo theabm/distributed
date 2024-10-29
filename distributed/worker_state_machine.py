@@ -75,6 +75,7 @@ TaskStateState: TypeAlias = Literal[
     "rescheduled",
     "resumed",
     "waiting",
+    "external",
 ]
 
 # TaskState.state subsets
@@ -450,6 +451,24 @@ class TaskFinishedMsg(SendMessageToScheduler):
         d["status"] = "OK"
         return d
 
+@dataclass
+class ExternalTaskFinishedMsg(SendMessageToScheduler):
+    op = "external-task-finished"
+
+    key: str
+    run_id: int
+    nbytes: int | None
+    type: bytes  # serialized class
+    typename: str
+    metadata: dict
+    thread: int | None
+    startstops: list[StartStop]
+    __slots__ = tuple(__annotations__)
+
+    def to_dict(self) -> dict[str, Any]:
+        d = super().to_dict()
+        d["status"] = "OK"
+        return d
 
 @dataclass
 class TaskErredMsg(SendMessageToScheduler):
@@ -1016,6 +1035,16 @@ class UpdateDataEvent(StateMachineEvent):
         out.data = dict.fromkeys(self.data)
         return out
 
+@dataclass
+class ExternalTaskEvent(StateMachineEvent):
+    __slots__ = ("data",)
+    data: dict[str, object]
+
+    def to_loggable(self, *, handled: float) -> StateMachineEvent:
+        out = copy(self)
+        out.handled = handled
+        out.data = dict.fromkeys(self.data)
+        return out
 
 @dataclass
 class SecedeEvent(StateMachineEvent):
@@ -1788,6 +1817,36 @@ class WorkerState:
             startstops=ts.startstops,
             stimulus_id=stimulus_id,
         )
+    
+    def _get_external_task_finished_msg(
+        self,
+        ts: TaskState,
+        run_id: int,
+        stimulus_id: str,
+    ) -> ExternalTaskFinishedMsg:
+        if self.validate:
+            assert ts.state == "memory"
+            assert ts.key in self.data or ts.key in self.actors
+            assert ts.type is not None
+            assert ts.nbytes is not None
+
+        try:
+            type_serialized = pickle.dumps(ts.type)
+        except Exception:
+            # Some types fail pickling (example: _thread.lock objects);
+            # send their name as a best effort.
+            type_serialized = pickle.dumps(typename(ts.type))
+        return ExternalTaskFinishedMsg(
+            key=ts.key,
+            run_id=run_id,
+            nbytes=ts.nbytes,
+            type=type_serialized,
+            typename=typename(ts.type),
+            metadata=ts.metadata,
+            thread=self.threads.get(ts.key),
+            startstops=ts.startstops,
+            stimulus_id=stimulus_id,
+        )
 
     ###############
     # Transitions #
@@ -2330,6 +2389,21 @@ class WorkerState:
         return self._transition_to_memory(
             ts, value, False, run_id=RUN_ID_SENTINEL, stimulus_id=stimulus_id
         )
+    
+    def _transition_external_memory(
+        self, ts: TaskState, value: object, run_id: int, *, stimulus_id: str
+    ) -> RecsInstrs:
+        """This transition is triggered by scatter().
+        This transition sends a message back to the scheduler, because the
+        scheduler does know this key exists.
+        """
+        return self._transition_to_memory(
+            ts,
+            value,
+            "external-task-finished",
+            run_id=RUN_ID_SENTINEL,
+            stimulus_id=stimulus_id,
+        )
 
     def _transition_flight_memory(
         self, ts: TaskState, value: object, run_id: int, *, stimulus_id: str
@@ -2372,7 +2446,7 @@ class WorkerState:
         self,
         ts: TaskState,
         value: object,
-        msg_type: Literal[False, "add-keys", "task-finished"],
+        msg_type: Literal[False, "add-keys", "task-finished", "external-task-finished"],
         run_id: int,
         *,
         stimulus_id: str,
@@ -2380,7 +2454,7 @@ class WorkerState:
         """Insert a task's output in self.data and set the state to memory.
         This method is the one and only place where keys are inserted in self.data.
 
-        There are three ways to get here:
+        There are four ways to get here:
         1. task execution just terminated successfully. Initial state is one of
            - executing
            - long-running
@@ -2392,6 +2466,7 @@ class WorkerState:
         3. scatter. In this case *normally* the task is in released state, but nothing
            stops a client to scatter a key while is in any other state; these race
            conditions are not well tested and are expected to misbehave.
+        4. scatter. External tasks
         """
         recommendations: Recs = {}
         instructions: Instructions = []
@@ -2450,6 +2525,16 @@ class WorkerState:
             assert run_id != RUN_ID_SENTINEL
             instructions.append(
                 self._get_task_finished_msg(
+                    ts,
+                    run_id=run_id,
+                    stimulus_id=stimulus_id,
+                )
+            )
+        # NOTE: this will trigger transitions
+        elif msg_type == "external-task-finished":
+            # assert run_id != RUN_ID_SENTINEL
+            instructions.append(
+                self._get_external_task_finished_msg(
                     ts,
                     run_id=run_id,
                     stimulus_id=stimulus_id,
@@ -2538,6 +2623,7 @@ class WorkerState:
         ("waiting", "constrained"): _transition_waiting_constrained,
         ("waiting", "ready"): _transition_waiting_ready,
         ("waiting", "released"): _transition_generic_released,
+        ("external", "memory"): _transition_external_memory,
     }
 
     def _notify_plugins(self, method_name: str, *args: Any, **kwargs: Any) -> None:
@@ -2725,6 +2811,17 @@ class WorkerState:
             self.log.append(
                 (key, "receive-from-scatter", ts.state, ev.stimulus_id, time())
             )
+        return recommendations, []
+
+    @_handle_event.register
+    def _handle_external_task(self, ev: ExternalTaskEvent) -> RecsInstrs:
+        recommendations: Recs = {}
+        for key, value in ev.data.items():
+            self.tasks[key] = ts = TaskState(key, state="external")
+            self.task_counter.new_task(ts)
+
+            recommendations[ts] = ("memory", value, RUN_ID_SENTINEL)
+            self.log.append((key, "external-task", ts.state, ev.stimulus_id, time()))
         return recommendations, []
 
     @_handle_event.register

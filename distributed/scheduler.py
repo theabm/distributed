@@ -161,6 +161,7 @@ TaskStateState: TypeAlias = Literal[
     "memory",
     "erred",
     "forgotten",
+    "external",
 ]
 
 ALL_TASK_STATES: Set[TaskStateState] = set(TaskStateState.__args__)  # type: ignore
@@ -2566,6 +2567,65 @@ class SchedulerState:
 
         return recommendations, client_msgs, {}
 
+    def transition_external_memory(
+        self,
+        key: str,
+        stimulus_id: str,
+        *,
+        nbytes: int | None = None,
+        type: bytes | None = None,
+        typename: str | None = None,
+        worker: str,
+        startstops: list[dict] | None = None,
+        **kwargs: Any,
+    ) -> RecsMsgs:
+        ts = self.tasks[key]
+        assert worker
+        assert isinstance(worker, str)
+
+        if self.validate:
+            assert not ts.waiting_on
+            assert not ts.who_has, (ts, ts.who_has)
+            assert not ts.exception_blame
+            assert ts.state == "external"
+
+        ws = self.workers.get(worker)
+        if ws is None:
+            return {key: "released"}, {}, {}
+
+        #############################
+        # Update Timing Information #
+        #############################
+        if startstops:
+            for startstop in startstops:
+                ts.group.add_duration(
+                    stop=startstop["stop"],
+                    start=startstop["start"],
+                    action=startstop["action"],
+                )
+        # WARNING Missing a stealing block but I dont think I want this
+        # since I dont want other workers to steal external tasks.
+
+        ############################
+        # Update State Information #
+        ############################
+        if nbytes is not None:
+            ts.set_nbytes(nbytes)
+
+        self._exit_processing_common(ts)
+
+        recommendations: Recs = {}
+        client_msgs: Msgs = {}
+        self._add_to_memory(
+            ts, ws, recommendations, client_msgs, type=type, typename=typename
+        )
+
+        if self.validate:
+            assert not ts.processing_on
+            assert not ts.waiting_on
+
+        return recommendations, client_msgs, {}
+
     def _transition_memory_released(self, key: Key, stimulus_id: str) -> RecsMsgs:
         ts = self.tasks[key]
 
@@ -2650,6 +2710,39 @@ class SchedulerState:
             "traceback": failing_ts.traceback,
         }
         for cs in ts.who_wants or ():
+            client_msgs[cs.client_key] = [report_msg]
+
+        ts.state = "erred"
+
+        # TODO: waiting data?
+        return recommendations, client_msgs, {}
+
+    def transition_external_erred(self, key: str, stimulus_id: str) -> RecsMsgs:
+        ts = self.tasks[key]
+        recommendations: Recs = {}
+        client_msgs: Msgs = {}
+
+        if self.validate:
+            with log_errors(pdb=LOG_PDB):
+                assert ts.exception_blame
+                assert not ts.who_has
+                assert not ts.waiting_on
+
+        failing_ts = ts.exception_blame
+        assert failing_ts
+
+        for dts in ts.dependents:
+            if not dts.who_has:
+                dts.exception_blame = failing_ts
+                recommendations[dts.key] = "erred"
+
+        report_msg = {
+            "op": "task-erred",
+            "key": key,
+            "exception": failing_ts.exception,
+            "traceback": failing_ts.traceback,
+        }
+        for cs in ts.who_wants:
             client_msgs[cs.client_key] = [report_msg]
 
         ts.state = "erred"
@@ -3053,6 +3146,7 @@ class SchedulerState:
         ("queued", "erred"): _transition_queued_erred,
         ("processing", "released"): _transition_processing_released,
         ("processing", "memory"): _transition_processing_memory,
+        ("external", "memory"): transition_external_memory,
         ("processing", "erred"): _transition_processing_erred,
         ("no-worker", "released"): _transition_no_worker_released,
         ("no-worker", "processing"): _transition_no_worker_processing,
@@ -3062,6 +3156,7 @@ class SchedulerState:
         ("erred", "released"): _transition_erred_released,
         ("memory", "released"): _transition_memory_released,
         ("released", "erred"): _transition_released_erred,
+        ("external", "erred"): transition_external_erred,
     }
 
     def story(
@@ -3915,6 +4010,7 @@ class Scheduler(SchedulerState, ServerNode):
 
         worker_handlers = {
             "task-finished": self.handle_task_finished,
+            "external-task-finished": self.handle_external_task_finished,
             "task-erred": self.handle_task_erred,
             "release-worker-data": self.release_worker_data,
             "add-keys": self.add_keys,
@@ -5314,6 +5410,31 @@ class Scheduler(SchedulerState, ServerNode):
 
         return recommendations, client_msgs, worker_msgs
 
+    def stimulus_external_task_finished(
+        self, key: Key, worker: str, stimulus_id: str, run_id: int, **kwargs: Any
+    ) -> RecsMsgs:
+        """Mark that an external task has finished execution on a particular worker"""
+        logger.debug("Stimulus external task finished %s[%d] %s", key, run_id, worker)
+
+        recommendations: Recs = {}
+        client_msgs: Msgs = {}
+        worker_msgs: Msgs = {}
+
+        ts = self.tasks.get(key)
+        if ts.state == "external":
+            if kwargs["metadata"]:
+                if ts.metadata is None:
+                    ts.metadata = dict()
+                ts.metadata.update(kwargs["metadata"])
+            r: tuple = self._transition(
+                key, "memory", stimulus_id, worker=worker, **kwargs
+            )
+            recommendations, client_msgs, worker_msgs = r
+
+            if ts.state == "memory":
+                self.add_keys(worker=worker, keys=[key])
+        return recommendations, client_msgs, worker_msgs
+
     def stimulus_task_erred(
         self,
         key=None,
@@ -5630,7 +5751,7 @@ class Scheduler(SchedulerState, ServerNode):
             )
         self.report({"op": "cancelled-keys", "keys": cancelled_keys})
 
-    def client_desires_keys(self, keys: Collection[Key], client: str) -> None:
+    def client_desires_keys(self, keys: Collection[Key], client: str, external: bool = False) -> None:
         cs = self.clients.get(client)
         if cs is None:
             # For publish, queues etc.
@@ -6029,6 +6150,23 @@ class Scheduler(SchedulerState, ServerNode):
             key=key, worker=worker, stimulus_id=stimulus_id, **msg
         )
         recommendations, client_msgs, worker_msgs = r
+        self._transitions(recommendations, client_msgs, worker_msgs, stimulus_id)
+        self.send_all(client_msgs, worker_msgs)
+
+        self.stimulus_queue_slots_maybe_opened(stimulus_id=stimulus_id)
+
+    def handle_external_task_finished(
+        self, key: str, worker: str, stimulus_id: str, **msg: Any
+    ) -> None:
+        if worker not in self.workers:
+            return
+        # self.validate_key(key)
+
+        r: tuple = self.stimulus_external_task_finished(
+            key=key, worker=worker, stimulus_id=stimulus_id, **msg
+        )
+        recommendations, client_msgs, worker_msgs = r
+
         self._transitions(recommendations, client_msgs, worker_msgs, stimulus_id)
         self.send_all(client_msgs, worker_msgs)
 

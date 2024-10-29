@@ -270,6 +270,8 @@ class Future(TaskRef):
         Client that should own this future.  Defaults to _get_global_client()
     inform: bool
         Do we inform the scheduler that we need an update on this future
+    external: bool
+        Do we consider this the data associated to this future as external
     state: FutureState
         The state of the future
 
@@ -301,13 +303,14 @@ class Future(TaskRef):
     # Make sure this stays unique even across multiple processes or hosts
     _uid = uuid.uuid4().hex
 
-    def __init__(self, key, client=None, state=None, _id=None):
+    def __init__(self, key, client=None, state=None, _id=None, external=False):
         self.key = key
         self._cleared = False
         self._client = client
         self._id = _id or (Future._uid, next(Future._counter))
         self._input_state = state
         self._state = None
+        self._external = external
         self._bind_late()
 
     @property
@@ -327,7 +330,9 @@ class Future(TaskRef):
             if self.key in self._client.futures:
                 self._state = self._client.futures[self.key]
             else:
-                self._state = self._client.futures[self.key] = FutureState(self.key)
+                self._state = self._client.futures[self.key] = FutureState(
+                    self.key, external=self._external
+                )
 
             if self._input_state is not None:
                 try:
@@ -629,13 +634,20 @@ class FutureState:
     This is shared between all Futures with the same key and client.
     """
 
-    __slots__ = ("_event", "key", "status", "type", "exception", "traceback")
+    __slots__ = (
+        "_event",
+        "key",
+        "status",
+        "type",
+        "exception",
+        "traceback",
+    )
 
-    def __init__(self, key: str):
+    def __init__(self, key: str, external: bool = False):
         self._event = None
         self.key = key
         self.exception = None
-        self.status = "pending"
+        self.status = "external" if external else "pending"
         self.traceback = None
         self.type = None
 
@@ -2575,12 +2587,14 @@ class Client(SyncMethodMixin):
     async def _scatter(
         self,
         data,
+        keys=None,
         workers=None,
         broadcast=False,
         direct=None,
         local_worker=None,
         timeout=no_default,
         hash=True,
+        external=False,
     ):
         if timeout is no_default:
             timeout = self._timeout
@@ -2600,7 +2614,9 @@ class Client(SyncMethodMixin):
             unpack = True
             data = [data]
         if isinstance(data, (list, tuple)):
-            if hash:
+            if keys:
+                names = [k for k in keys]
+            elif hash:
                 names = [type(x).__name__ + "-" + tokenize(x) for x in data]
             else:
                 names = [type(x).__name__ + "-" + uuid.uuid4().hex for x in data]
@@ -2646,11 +2662,14 @@ class Client(SyncMethodMixin):
                     raise ValueError("No valid workers found")
                 workers = list(nthreads.keys())
 
-                _, who_has, nbytes = await scatter_to_workers(workers, data2, self.rpc)
-
-                await self.scheduler.update_data(
-                    who_has=who_has, nbytes=nbytes, client=self.id
+                _, who_has, nbytes = await scatter_to_workers(
+                    workers, data2, self.rpc, external=external
                 )
+
+                if not external:
+                    await self.scheduler.update_data(
+                        who_has=who_has, nbytes=nbytes, client=self.id
+                    )
             else:
                 await self.scheduler.scatter(
                     data=data2,
@@ -2660,7 +2679,7 @@ class Client(SyncMethodMixin):
                     timeout=timeout,
                 )
 
-        out = {k: Future(k, self) for k in data}
+        out = {k: Future(k, self, external=external) for k in data}
         for key, typ in types.items():
             self.futures[key].finish(type=typ)
 
@@ -2679,12 +2698,14 @@ class Client(SyncMethodMixin):
     def scatter(
         self,
         data,
+        keys=None,
         workers=None,
         broadcast=False,
         direct=None,
         hash=True,
         timeout=no_default,
         asynchronous=None,
+        external=False,
     ):
         """Scatter data into distributed memory
 
@@ -2697,6 +2718,8 @@ class Client(SyncMethodMixin):
         ----------
         data : list, dict, or object
             Data to scatter out to workers.  Output type matches input type.
+        keys: list, dict, or object
+            keys of the data to scatter to the workers.
         workers : list of tuples (optional)
             Optionally constrain locations of data.
             Specify workers as hostname/port pairs, e.g.
@@ -2721,6 +2744,8 @@ class Client(SyncMethodMixin):
             ``dask.distributed.TimeoutError``
         asynchronous: bool
             If True the client is in asynchronous mode
+        external: bool
+            If True the data has been generated from an external application
 
         Returns
         -------
@@ -2785,6 +2810,7 @@ class Client(SyncMethodMixin):
         return self.sync(
             self._scatter,
             data,
+            keys=keys,
             workers=workers,
             broadcast=broadcast,
             direct=direct,
@@ -2792,6 +2818,7 @@ class Client(SyncMethodMixin):
             timeout=timeout,
             asynchronous=asynchronous,
             hash=hash,
+            external=external,
         )
 
     async def _cancel(self, futures, reason=None, msg=None, force=False):
