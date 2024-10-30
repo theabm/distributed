@@ -303,7 +303,7 @@ class Future(TaskRef):
     # Make sure this stays unique even across multiple processes or hosts
     _uid = uuid.uuid4().hex
 
-    def __init__(self, key, client=None, state=None, _id=None, external=False):
+    def __init__(self, key, client=None, external=False, state=None, _id=None):
         self.key = key
         self._cleared = False
         self._client = client
@@ -403,8 +403,8 @@ class Future(TaskRef):
             The result of the computation. Or a coroutine if the client is asynchronous.
         """
         self._verify_initialized()
-        with shorten_traceback():
-            return self.client.sync(self._result, callback_timeout=timeout)
+        # with shorten_traceback():
+        return self.client.sync(self._result, callback_timeout=timeout)
 
     async def _result(self, raiseit=True):
         await self._state.wait()
