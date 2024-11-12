@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Generic, NewType, TypeVar, cast
 from tornado.ioloop import IOLoop
 
 import dask.config
+from dask._task_spec import Task, _inline_recursively
 from dask.core import flatten
 from dask.typing import Key
 from dask.utils import parse_bytes, parse_timedelta
@@ -505,6 +506,10 @@ class SchedulerShuffleState(Generic[_T_partition_id]):
     def run_id(self) -> int:
         return self.run_spec.run_id
 
+    @property
+    def archived(self) -> bool:
+        return self._archived_by is not None
+
     def __str__(self) -> str:
         return f"{self.__class__.__name__}<{self.id}[{self.run_id}]>"
 
@@ -575,3 +580,37 @@ def p2p_barrier(id: ShuffleId, run_ids: list[int]) -> int:
         raise
     except Exception as e:
         raise RuntimeError(f"P2P {id} failed during barrier phase") from e
+
+
+class P2PBarrierTask(Task):
+    spec: ShuffleSpec
+
+    __slots__ = tuple(__annotations__)
+
+    def __init__(
+        self,
+        key: Any,
+        func: Callable[..., Any],
+        /,
+        *args: Any,
+        spec: ShuffleSpec,
+        **kwargs: Any,
+    ):
+        self.spec = spec
+        super().__init__(key, func, *args, **kwargs)
+
+    def copy(self) -> P2PBarrierTask:
+        return P2PBarrierTask(
+            self.key, self.func, *self.args, spec=self.spec, **self.kwargs
+        )
+
+    def __repr__(self) -> str:
+        return f"P2PBarrierTask({self.key!r})"
+
+    def inline(self, dsk: dict[Key, Any]) -> P2PBarrierTask:
+        new_args = _inline_recursively(self.args, dsk)
+        new_kwargs = _inline_recursively(self.kwargs, dsk)
+        assert self.func is not None
+        return P2PBarrierTask(
+            self.key, self.func, *new_args, spec=self.spec, **new_kwargs
+        )
